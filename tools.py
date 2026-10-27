@@ -128,9 +128,13 @@ def tool_rank_indicator(df, indicator_catalog, country_catalog, indicator_code, 
     if used_count == 0:
         raise ValueError(f"{year}년에 {info['name_ko']} 데이터가 있는 국가가 없습니다.")
         
-    # 순위 계산: 같은 값이면 같은 순위 (rank method='min')
-    # 기본은 수치가 큰 순서(descending). order가 bottom이면 오름차순
-    sub_df["rank"] = sub_df["value"].rank(method="min", ascending=False).astype(int)
+    # 지표 방향성 반영
+    direction = info.get("direction", "neutral")
+    is_lower_better = (direction == "lower_is_better")
+    is_neutral = (direction == "neutral")
+    
+    # 순위 계산: lower_is_better면 낮은 순으로 1위(ascending=True), 그 외에는 높은 순으로 1위(ascending=False)
+    sub_df["rank"] = sub_df["value"].rank(method="min", ascending=is_lower_better).astype(int)
     sub_df = sub_df.sort_values(["rank", "country_name"])
     
     highlight_codes = set(highlight) if highlight else set()
@@ -193,6 +197,10 @@ def tool_rank_indicator(df, indicator_catalog, country_catalog, indicator_code, 
     warnings = []
     if year_auto_selected:
         warnings.append(f"기준 연도가 지정되지 않아 해당 지표의 권장 기준연도({year}년)가 자동 적용되었습니다.")
+    if is_neutral:
+        warnings.append(f"{info['name_ko']} 지표는 중립적 지표로, 순위가 높다고 해서 반드시 더 좋거나 우수한 것은 아닙니다.")
+        
+    direction_note = "낮을수록 좋음 (1위=가장 낮음)" if is_lower_better else ("높을수록 좋다는 뜻은 아님" if is_neutral else "높을수록 좋음 (1위=가장 높음)")
         
     logger.info(f"[TOOL] rank_indicator | indicator={indicator_code} | year={year} | used={used_count} | excluded={excluded_count}")
     
@@ -835,23 +843,432 @@ def tool_robustness_check(df, indicator_catalog, country_catalog, x_indicator="S
         }
     }
 
+# ==============================================================================
+# Tool 7: country_profile
+# ==============================================================================
+def tool_country_profile(df, indicator_catalog, country_catalog, country_code="KOR", year=None, **kwargs):
+    """
+    한 국가의 11개 지표 최신값, 그 값의 연도, 세계 순위, 백분위, 같은 소득 그룹 중앙값과 비교 (카드형)
+    """
+    country_lookup = {c["country_code"]: c for c in country_catalog}
+    if country_code not in country_lookup:
+        raise ValueError(f"존재하지 않는 국가 코드: {country_code}")
+        
+    c_info = country_lookup[country_code]
+    target_income_group = c_info.get("income_group")
+    real_df = df[~df["is_aggregate"]]
+    
+    indicators_profile = []
+    
+    for code, info in indicator_catalog.items():
+        sub = real_df[(real_df["country_code"] == country_code) & (real_df["indicator_code"] == code)]
+        
+        direction = info.get("direction", "neutral")
+        is_lower_better = (direction == "lower_is_better")
+        is_neutral = (direction == "neutral")
+        direction_note = "낮을수록 좋음 (1위 = 가장 낮음)" if is_lower_better else ("높을수록 좋다는 뜻은 아님" if is_neutral else "높을수록 좋음")
+        
+        if sub.empty:
+            indicators_profile.append({
+                "indicator_code": code,
+                "name_ko": info["name_ko"],
+                "unit": info["unit"],
+                "direction": direction,
+                "direction_note": direction_note,
+                "value": None,
+                "year": None,
+                "world_rank": None,
+                "world_total": None,
+                "rank_text": "데이터 없음",
+                "percentile": None,
+                "peer_median": None,
+                "peer_diff": None,
+                "peer_rank": None,
+                "peer_total": None,
+                "peer_rank_text": "데이터 없음",
+                "note": "해당 국가의 데이터가 없습니다."
+            })
+            continue
+            
+        # 권장 기준연도 값을 기본 사용 (그 연도에 값이 없을 때만 가장 가까운 과거 연도를 쓰고 연도 표시)
+        target_year = int(year) if year is not None else info["recommended_year"]
+        c_row = sub[sub["year"] == target_year]
+        year_fallback_note = None
+        
+        if c_row.empty:
+            past = sub[sub["year"] <= target_year].sort_values("year")
+            if not past.empty:
+                c_row = past.iloc[[-1]]
+                val_year = int(c_row["year"].iloc[0])
+                year_fallback_note = f"권장 기준연도({target_year}년) 결측으로 과거 {val_year}년 데이터 사용"
+            else:
+                c_row = sub.sort_values("year").iloc[[-1]]
+                val_year = int(c_row["year"].iloc[0])
+                year_fallback_note = f"권장 기준연도({target_year}년) 결측으로 {val_year}년 데이터 사용"
+        else:
+            val_year = target_year
+            
+        val = float(c_row["value"].iloc[0])
+        
+        # 그 연도에서 전체 실제 국가들 데이터
+        y_all = real_df[(real_df["indicator_code"] == code) & (real_df["year"] == val_year)].copy()
+        
+        # 순위: lower_is_better면 낮은 순으로 1위(ascending=True)
+        y_all["rank"] = y_all["value"].rank(method="min", ascending=is_lower_better).astype(int)
+        
+        c_match = y_all[y_all["country_code"] == country_code]
+        w_rank = int(c_match["rank"].iloc[0]) if not c_match.empty else None
+        w_total = len(y_all)
+        rank_text = f"{w_total}개국 중 {w_rank}위" if w_rank is not None else "순위 없음"
+        
+        # 상위 백분위 계산 (1위에 가까울수록 100%)
+        percentile = round((1 - (w_rank - 1) / w_total) * 100, 1) if w_rank and w_total > 1 else 100.0
+        
+        # 같은 소득 그룹의 중앙값 및 소득그룹 내 순위
+        peer_df = y_all[y_all["income_group"] == target_income_group]
+        peer_match = peer_df[peer_df["country_code"] == country_code]
+        peer_rank = int(peer_match["rank"].iloc[0]) if not peer_match.empty else None
+        peer_total = len(peer_df)
+        peer_rank_text = f"{peer_total}개국 중 {peer_rank}위" if peer_rank is not None else "순위 없음"
+        
+        peer_med = float(peer_df["value"].median()) if not peer_df.empty else None
+        peer_diff = round(val - peer_med, 4) if peer_med is not None else None
+        
+        indicators_profile.append({
+            "indicator_code": code,
+            "name_ko": info["name_ko"],
+            "unit": info["unit"],
+            "direction": direction,
+            "direction_note": direction_note,
+            "value": sanitize_value(val),
+            "year": val_year,
+            "is_recommended_year": (val_year == info["recommended_year"]),
+            "year_fallback_note": year_fallback_note,
+            "world_rank": w_rank,
+            "world_total": w_total,
+            "rank_text": rank_text,
+            "percentile": percentile,
+            "peer_median": sanitize_value(peer_med),
+            "peer_diff": sanitize_value(peer_diff),
+            "peer_rank": peer_rank,
+            "peer_total": peer_total,
+            "peer_rank_text": peer_rank_text,
+            "income_group": target_income_group
+        })
+        
+    logger.info(f"[TOOL] country_profile | country={country_code} | income_group={target_income_group}")
+    
+    return {
+        "tool": "country_profile",
+        "params": {"country_code": country_code, "year": year},
+        "year": "각 지표별 최신 가용 연도",
+        "country": {
+            "code": country_code,
+            "name": c_info["country_name"],
+            "region": c_info.get("region"),
+            "income_group": target_income_group
+        },
+        "used_countries_count": 1,
+        "excluded_countries_count": 0,
+        "excluded_reason": "선택한 대상 국가의 프로필을 생성했습니다.",
+        "warnings": ["지표마다 최신 조사 연도가 다를 수 있으므로 각 카드의 기준 연도를 확인하세요."],
+        "cautions": [
+            "국가 간 단순 비교 시 인구 규모, 지리적 특성, 보건의료 체계 차이를 고려해야 합니다.",
+            "소득 그룹 중앙값과의 차이는 해당 소득군 내에서의 상대적 수준을 나타냅니다."
+        ],
+        "data": sanitize_records(indicators_profile),
+        "chart_data": {
+            "type": "radar",
+            "labels": [item["name_ko"] for item in indicators_profile if item["percentile"] is not None],
+            "datasets": [{
+                "label": f"{c_info['country_name']} 세계 백분위 (상위 %)",
+                "data": [item["percentile"] for item in indicators_profile if item["percentile"] is not None],
+                "backgroundColor": "rgba(59, 130, 246, 0.2)",
+                "borderColor": "rgba(37, 99, 235, 1)",
+                "pointBackgroundColor": "rgba(37, 99, 235, 1)"
+            }]
+        }
+    }
+
+# ==============================================================================
+# Tool 8: group_summary
+# ==============================================================================
+def tool_group_summary(df, indicator_catalog, country_catalog, indicator_code, group_by="income_group", year=None, **kwargs):
+    """
+    소득 그룹 또는 지역별 지표 중앙값·평균·국가 수 (막대)
+    """
+    if indicator_code not in indicator_catalog:
+        raise ValueError(f"유효하지 않은 지표 코드: {indicator_code}")
+        
+    if group_by not in ["income_group", "region"]:
+        group_by = "income_group"
+        
+    info = indicator_catalog[indicator_code]
+    
+    if year is None:
+        year = info["recommended_year"]
+        year_auto_selected = True
+    else:
+        year = int(year)
+        year_auto_selected = False
+        
+    sub_df = df[(df["indicator_code"] == indicator_code) & (df["year"] == year) & (~df["is_aggregate"])].copy()
+    sub_df = sub_df.dropna(subset=[group_by, "value"])
+    
+    real_countries = [c for c in country_catalog if not c["is_aggregate"] and c.get(group_by)]
+    total_real = len(real_countries)
+    used_count = len(sub_df)
+    excluded_count = total_real - used_count
+    
+    if used_count == 0:
+        raise ValueError(f"{year}년에 {info['name_ko']} 데이터가 없습니다.")
+        
+    group_stats = []
+    
+    # 소득 그룹 표준 순서 정의
+    income_order = ["Low income", "Lower middle income", "Upper middle income", "High income"]
+    
+    for grp_name, g in sub_df.groupby(group_by):
+        vals = g["value"]
+        group_stats.append({
+            "group": grp_name,
+            "count": int(len(vals)),
+            "median": sanitize_value(float(vals.median())),
+            "mean": sanitize_value(float(vals.mean())),
+            "std": sanitize_value(float(vals.std())) if len(vals) > 1 else None,
+            "min": sanitize_value(float(vals.min())),
+            "max": sanitize_value(float(vals.max()))
+        })
+        
+    if group_by == "income_group":
+        group_stats.sort(key=lambda x: income_order.index(x["group"]) if x["group"] in income_order else 99)
+    else:
+        group_stats.sort(key=lambda x: x["median"] if x["median"] is not None else 0, reverse=True)
+        
+    labels = [g["group"] for g in group_stats]
+    medians = [g["median"] for g in group_stats]
+    means = [g["mean"] for g in group_stats]
+    counts = [g["count"] for g in group_stats]
+    
+    warnings = []
+    if year_auto_selected:
+        warnings.append(f"기준 연도가 지정되지 않아 권장 기준연도({year}년)가 적용되었습니다.")
+        
+    logger.info(f"[TOOL] group_summary | indicator={indicator_code} | group_by={group_by} | year={year} | used={used_count}")
+    
+    return {
+        "tool": "group_summary",
+        "params": {
+            "indicator_code": indicator_code,
+            "group_by": group_by,
+            "year": year
+        },
+        "year": year,
+        "indicator": {
+            "code": indicator_code,
+            "name": info["indicator_name"],
+            "name_ko": info["name_ko"],
+            "unit": info["unit"]
+        },
+        "used_countries_count": used_count,
+        "excluded_countries_count": excluded_count,
+        "excluded_reason": f"해당 연도 결측치 {excluded_count}개국, 집계 행 49개 제외",
+        "warnings": warnings,
+        "cautions": [
+            "그룹 내 국가 간에도 편차가 크므로 평균과 중앙값을 함께 확인하십시오.",
+            "그룹별 수집 국가 수의 차이에 유의하십시오."
+        ],
+        "data": sanitize_records(group_stats),
+        "chart_data": {
+            "type": "bar",
+            "labels": labels,
+            "datasets": [
+                {
+                    "label": f"중앙값 ({info['unit']})",
+                    "data": medians,
+                    "backgroundColor": "rgba(59, 130, 246, 0.75)",
+                    "borderColor": "rgba(37, 99, 235, 1)",
+                    "borderWidth": 1
+                },
+                {
+                    "label": f"평균값 ({info['unit']})",
+                    "data": means,
+                    "backgroundColor": "rgba(16, 185, 129, 0.65)",
+                    "borderColor": "rgba(5, 150, 105, 1)",
+                    "borderWidth": 1
+                }
+            ]
+        }
+    }
+
+# ==============================================================================
+# Tool 9: correlation_with
+# ==============================================================================
+def tool_correlation_with(df, indicator_catalog, country_catalog, target_indicator="SP.DYN.LE00.IN", year=2023, **kwargs):
+    """
+    한 지표(기본 기대수명)와 나머지 지표들의 같은 연도 상관계수 표 (막대)
+    - 주의사항: 반드시 "상관관계는 인과관계가 아니다" 포함
+    - 서로 다른 지표 비교 시 반드시 같은 연도만 사용 (기본 2023년)
+    """
+    if target_indicator not in indicator_catalog:
+        raise ValueError(f"유효하지 않은 기준 지표 코드: {target_indicator}")
+        
+    target_info = indicator_catalog[target_indicator]
+    if year is None:
+        year = 2023
+    else:
+        year = int(year)
+        
+    real_df = df[~df["is_aggregate"]]
+    target_sub = real_df[(real_df["indicator_code"] == target_indicator) & (real_df["year"] == year)][["country_code", "value"]].rename(columns={"value": "target_val"})
+    
+    if target_sub.empty:
+        raise ValueError(f"{year}년에 기준 지표({target_info['name_ko']}) 데이터가 없습니다.")
+        
+    corr_results = []
+    
+    for code, info in indicator_catalog.items():
+        if code == target_indicator:
+            continue
+            
+        x_sub = real_df[(real_df["indicator_code"] == code) & (real_df["year"] == year)][["country_code", "value"]].rename(columns={"value": "x_val"})
+        merged = x_sub.merge(target_sub, on="country_code").dropna(subset=["x_val", "target_val"])
+        common_count = len(merged)
+        
+        if common_count < 10:
+            corr_results.append({
+                "indicator_code": code,
+                "name_ko": info["name_ko"],
+                "unit": info["unit"],
+                "common_countries_count": common_count,
+                "correlation": None,
+                "correlation_log": None,
+                "status": "데이터 부족 (공통 10개국 미만 제외)"
+            })
+            continue
+            
+        r_raw = float(merged[["x_val", "target_val"]].corr().iloc[0, 1])
+        
+        # log 변환 상관계수 (x > 0인 경우)
+        pos = merged[merged["x_val"] > 0]
+        if len(pos) >= 10:
+            r_log = float(np.corrcoef(np.log10(pos["x_val"]), pos["target_val"])[0, 1])
+        else:
+            r_log = r_raw
+            
+        is_small_sample = (common_count < 100)
+        sample_caution = "국가 수가 적어 다른 지표와 직접 비교하기 어렵다" if is_small_sample else None
+            
+        corr_results.append({
+            "indicator_code": code,
+            "name_ko": info["name_ko"],
+            "unit": info["unit"],
+            "common_countries_count": common_count,
+            "n": common_count,
+            "correlation": round(r_raw, 4),
+            "correlation_log": round(r_log, 4),
+            "abs_corr": abs(r_raw),
+            "status": "정상 계산",
+            "is_small_sample": is_small_sample,
+            "sample_caution": sample_caution
+        })
+        
+    # 절댓값 상관계수 높은 순으로 정렬
+    valid_corrs = [c for c in corr_results if c["correlation"] is not None]
+    valid_corrs.sort(key=lambda x: x["abs_corr"], reverse=True)
+    
+    invalid_corrs = [c for c in corr_results if c["correlation"] is None]
+    sorted_all = valid_corrs + invalid_corrs
+    
+    # 차트 라벨에 계산 국가 수(n) 표기
+    labels = [f"{c['name_ko']} (n={c['n']})" for c in valid_corrs]
+    chart_vals = [c["correlation"] for c in valid_corrs]
+    bg_colors = [
+        "rgba(59, 130, 246, 0.75)" if v >= 0 else "rgba(239, 68, 68, 0.75)"
+        for v in chart_vals
+    ]
+    
+    logger.info(f"[TOOL] correlation_with | target={target_indicator} | year={year} | valid_indicators={len(valid_corrs)}")
+    
+    return {
+        "tool": "correlation_with",
+        "params": {"target_indicator": target_indicator, "year": year},
+        "year": year,
+        "target_indicator": {
+            "code": target_indicator,
+            "name": target_info["indicator_name"],
+            "name_ko": target_info["name_ko"],
+            "unit": target_info["unit"]
+        },
+        "used_countries_count": len(target_sub),
+        "excluded_countries_count": 0,
+        "excluded_reason": "동일 연도 공통 유효 국가가 10개 미만인 지표는 개별 상관계수 산출에서 제외되었습니다.",
+        "warnings": ["서로 다른 지표의 관계를 왜곡 없이 파악하기 위해 동일한 기준 연도(2023년) 데이터만 사용했습니다."],
+        "cautions": [
+            "상관관계는 인과관계가 아니다.",
+            "국가 수(n)가 100 미만인 지표(의사 수, 병상 수 등)는 표본 국가 수가 적어 다른 지표와 직접 비교하기 어렵습니다.",
+            "상관계수가 높더라도 두 지표 사이에 직접적인 인과성이 성립하지 않을 수 있습니다."
+        ],
+        "data": sanitize_records(sorted_all),
+        "chart_data": {
+            "type": "bar",
+            "indexAxis": "y",
+            "labels": labels,
+            "datasets": [{
+                "label": f"{target_info['name_ko']}와의 상관계수 (r)",
+                "data": chart_vals,
+                "backgroundColor": bg_colors,
+                "borderWidth": 1
+            }]
+        }
+    }
+
+# ==============================================================================
+# TOOL REGISTRY: 전체 9종 도구 등록 카탈로그
+# ==============================================================================
+TOOL_REGISTRY = {
+    "data_coverage": tool_data_coverage,
+    "rank_indicator": tool_rank_indicator,
+    "trend_compare": tool_trend_compare,
+    "scatter_relation": tool_scatter_relation,
+    "efficiency_residual": tool_efficiency_residual,
+    "robustness_check": tool_robustness_check,
+    "country_profile": tool_country_profile,
+    "group_summary": tool_group_summary,
+    "correlation_with": tool_correlation_with
+}
+
+def execute_tool(tool_name, df, indicator_catalog, country_catalog, **params):
+    """
+    도구 카탈로그에서 도구명을 조회하여 파라미터와 함께 실행하고 검증된 결과를 반환합니다.
+    """
+    if tool_name not in TOOL_REGISTRY:
+        raise ValueError(f"도구 카탈로그에 없는 도구입니다: '{tool_name}'")
+    func = TOOL_REGISTRY[tool_name]
+    return func(df, indicator_catalog, country_catalog, **params)
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     from data_loader import load_all_data
     df, catalog, countries = load_all_data()
     
-    print("\n--- Test Tool 4: scatter_relation ---")
-    s_res = tool_scatter_relation(df, catalog, countries, x_indicator="SH.XPD.CHEX.PP.CD", y_indicator="SP.DYN.LE00.IN", year=2023, x_log=True, highlight=["KOR", "USA"])
-    print(f"Scatter r: {s_res['correlation_raw']}, r_log: {s_res['correlation_log']}, representative: {s_res['correlation']} ({s_res['correlation_basis']})")
-    
-    print("\n--- Test Tool 6: robustness_check (peer=High income) ---")
-    r_res = tool_robustness_check(df, catalog, countries, peer="High income", highlight=["KOR", "USA"])
-    print("\n[Highlight 국가 조건별 순위 확인]")
-    for h in r_res["highlight_table"]:
-        print(f"- {h['country_name']} ({h['country_code']}): 순위 {h['ranks']} (상위10={h['top10_count']}회, 하위10={h['bottom10_count']}회)")
-        
-    print("\n[상위 10위 4회 달성 국가]")
-    for item in r_res["top_consistent"]:
-        if item["top10_count"] == 4:
-            print(f"- {item['country_name']} ({item['country_code']}): 4회")
+    print("\n--- Test Tool 7: country_profile (KOR, 권장 기준연도 및 방향성 검증) ---")
+    p_res = execute_tool("country_profile", df, catalog, countries, country_code="KOR")
+    check_codes = [
+        "SP.DYN.LE00.IN",
+        "SP.DYN.IMRT.IN",
+        "SH.XPD.CHEX.PP.CD",
+        "SH.PRV.SMOK",
+        "SH.MED.BEDS.ZS",
+        "NY.GDP.PCAP.CD"
+    ]
+    for item in p_res["data"]:
+        if item["indicator_code"] in check_codes:
+            print(f"[{item['indicator_code']}] {item['name_ko']} {item['year']}년: {item['value']}, {item['rank_text']} (방향: {item['direction']})")
+            
+    print("\n--- Test Tool 9: correlation_with (2023, n값 및 표본주의 검증) ---")
+    c_res = execute_tool("correlation_with", df, catalog, countries, target_indicator="SP.DYN.LE00.IN", year=2023)
+    for item in c_res["data"]:
+        if item["indicator_code"] in ["SH.MED.PHYS.ZS", "SH.MED.BEDS.ZS", "SH.XPD.CHEX.PP.CD"]:
+            print(f"- {item['name_ko']} ({item['indicator_code']}): n={item['n']}, r={item['correlation']}, 주의={item['sample_caution']}")
 
